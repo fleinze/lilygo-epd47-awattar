@@ -10,6 +10,7 @@ License CC BY-NC-SA 4.0
 
 #include <WiFiManager.h>  //version 2
 #include <time.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>  //version 7
 #include <Preferences.h>
@@ -58,7 +59,7 @@ const uint8_t CONNECT_RETRIES = 2;           // 2 retries
 const uint16_t CONFIG_PORTAL_TIMEOUT = 300;  // 5 minutes = 300s
 const char *HOSTNAME = "strompreis-disp";
 const char *TITLE = "Strompreis Dislay";
-std::vector<const char *> MENUIDS = { "wifi", "wifinoscan", "param", "info", "exit", "sep", "update" };
+std::vector<const char *> MENUIDS = { "wifi", "wifinoscan", /*"param",*/ "info", "exit", "sep", "update" };
 
 //time
 const char *time_zone = "CET-1CEST,M3.5.0,M10.5.0/3";  // timezone germany/austria with daylight saving
@@ -81,6 +82,7 @@ ErrorType error = NO_ERROR;
 //variablen für Einstellugen
 int new_val_hour;
 int new_val_minute;
+const int NEW_VAL_TOLERANCE = 10;
 String awattarurl;
 String ntpsrv;
 bool showbatt;
@@ -201,12 +203,14 @@ void setup() {
     configTzTime(time_zone, ntpsrv.c_str());
 
     time_t midnight = calculateMidnightTimestamp();
-    char url[strlen(awattarurl.c_str()) + 40];
-    sprintf(url, "%s?start=%ld000&end=%ld000", awattarurl.c_str(), midnight, (midnight + 172800UL));
+    //char url[strlen(awattarurl.c_str()) + 40];
+    String url = awattarurl + "?start=" + String(midnight) + "000&end=" + String(midnight + 172800UL) + "000";
+    //sprintf(url, "%s?start=%ld000&end=%ld000", awattarurl.c_str(), midnight, (midnight + 172800UL));
     JsonDocument awattar = awattarGet(url);
     len = awattar["data"].size();
-    if (len < 48 && (timeinfo.tm_hour > new_val_hour || (timeinfo.tm_hour >= new_val_hour && timeinfo.tm_min >= new_val_minute))) error = NOT_ENOUGH_HOURS_RECEIVED;  // not enought hours received
-    else if (len == 0) error = NO_DATA_RECEIVED;                                                                                                                      // no data received
+    if (len < 48 && (timeinfo.tm_hour * 60 + timeinfo.tm_min) >= (new_val_hour * 60 + new_val_minute - NEW_VAL_TOLERANCE)) error = NOT_ENOUGH_HOURS_RECEIVED;
+    //(timeinfo.tm_hour >= new_val_hour /*|| (timeinfo.tm_hour >= new_val_hour && timeinfo.tm_min >= max(new_val_minute-2,0))*/)) error = NOT_ENOUGH_HOURS_RECEIVED;  // not enought hours received
+    else if (len == 0) error = NO_DATA_RECEIVED;  // no data received
     else error = NO_ERROR;
     Serial.print("hours received: ");
     Serial.println(len);
@@ -230,15 +234,16 @@ void setup() {
   uint16_t currentMinute = timeinfo.tm_min;
   uint16_t currentSecond = timeinfo.tm_sec;
   uint32_t secondsUntilMidnight = (24 * 60 * 60) - (currentHour * 60 * 60 + currentMinute * 60 + currentSecond);
-  if (currentHour > new_val_hour || (currentHour == new_val_hour && currentMinute >= new_val_minute)) {
+  if ((currentHour * 60 + currentMinute) >= (new_val_hour * 60 + new_val_minute - NEW_VAL_TOLERANCE)) {
+    //currentHour >= new_val_hour) {                                // || (currentHour == new_val_hour && currentMinute >= new_val_minute)) {
     sleep_time = ((uint64_t)secondsUntilMidnight + 600) * 1000000;  //  600s nach mitternacht
   } else {
     sleep_time = ((uint64_t)secondsUntilMidnight - ((24 - new_val_hour) * 3600) + (60 * new_val_minute)) * 1000000;  // bis new_val_minute nach new_val_hour
   }
-  if (error == NOT_ENOUGH_HOURS_RECEIVED && !(currentHour > new_val_hour || (currentHour == new_val_hour && currentMinute >= new_val_minute))) {  // nicht genug daten empfangen
-    sleep_time = 3600000000;                                                                                                                      // 1 h
-  } else if (error == NO_DATA_RECEIVED) {                                                                                                         // keine Daten empfangen
-    sleep_time = 300000000;                                                                                                                       // 5 min
+  if (error == NOT_ENOUGH_HOURS_RECEIVED) {  // && !(currentHour > new_val_hour || (currentHour == new_val_hour && currentMinute >= new_val_minute))) {  // nicht genug daten empfangen
+    sleep_time = 3600000000;                 // 1 h
+  } else if (error == NO_DATA_RECEIVED) {    // keine Daten empfangen
+    sleep_time = 300000000;                  // 5 min
   }
   Serial.println(sleep_time);
   // uint64_t sleep_time = 60000000; // debug
@@ -419,7 +424,7 @@ void diagram(float marketprice[], time_t start_timestamp[], unsigned int len) {
 
   // stunden
   for (int i = 0; i < 24; ++i) {
-    cursor_x = i * rect_width + LEFT_MARGIN + 3;  
+    cursor_x = i * rect_width + LEFT_MARGIN + 3;
     if (len <= 24) cursor_y = 523;
     else cursor_y = 280;
     char hour[3];
@@ -456,7 +461,7 @@ time_t calculateMidnightTimestamp() {
   return mktime(currentTime);
 }
 
-JsonDocument awattarGet(const char *url) {
+JsonDocument awattarGet(String url) {
   HTTPClient http;
   JsonDocument json;
 
@@ -464,8 +469,24 @@ JsonDocument awattarGet(const char *url) {
   Serial.println(url);
 
   // Start  HTTP request
-  http.begin(url);
+  int index = url.indexOf(":", 7);
+  if (index >= 0) {  // wenn port in url gegeben ist muss die url zerlegt werden.
+    String protocol = url.substring(0, url.indexOf(':'));
+    String host = url.substring(url.indexOf("//") + 2, index);
+    String port = url.substring(index + 1, url.indexOf('/', index));
+    String uri = url.substring(url.indexOf('/', index), url.length());
+    if (protocol == "https") { // mit https-protokoll
+      WiFiClientSecure *client = new WiFiClientSecure;
+      client->setInsecure();
+      http.begin(*client, host, port.toInt(), uri, true);
+    } else if (protocol == "http") { // mit http-protokoll
+      http.begin(host, port.toInt(), uri);
+    }
+  } else { // kein port in url angegeben
+    http.begin(url);
+  }
 
+  http.useHTTP10(true); //kein accept-encoding-header und connection:close anstelle von keep-alive
   // GET request
   int httpResponseCode = http.GET();
 
@@ -475,6 +496,7 @@ JsonDocument awattarGet(const char *url) {
     Serial.println(httpResponseCode);
     // daten empfangen und json holen
     DeserializationError error = deserializeJson(json, http.getStream());
+
     if (error) {
       Serial.print("deserializeJson() failed: ");
       Serial.println(error.c_str());

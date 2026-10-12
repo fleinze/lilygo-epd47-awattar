@@ -4,6 +4,8 @@ Autor Florian Heinze
 
 License CC BY-NC-SA 4.0
 
+Benötigt arduino-esp32 Version < 3.0 (z.B. 2.0.17)
+
 */
 
 #include "epd_driver.h"
